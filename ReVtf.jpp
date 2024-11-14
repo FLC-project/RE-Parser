@@ -1,0 +1,1050 @@
+/*
+ * @(#)ReVtf.jpp       1.0 2022/01/04
+ *
+ * Copyright (c) 2022 Angelo Borsotti. All Rights Reserved.
+ *
+ */
+
+package pbsp;
+
+import java.io.*;
+import java.nio.*;
+import java.nio.file.*;
+import java.util.*;
+import java.net.*;
+import lbj.Cli;
+import lbj.Cli.*;
+import lbj.IoStream;
+import lbj.IoStream.*;
+import lbj.Listing.*;
+import lbj.*;
+import lbj.Parser;
+import lbj.Graph.*;
+import pbsp.ReParallel.*;
+
+/*
+ * The NFAs read as inputs are in vtf notation, see:
+ *
+ *    https://github.com/ondrik/automata-benchmarks/tree/master
+ *
+ * States have names, and also alphabet symbols which label arcs, which are usually strings.
+ * Arcs are represented as: from-state label to-state.
+ * There can be also empty labels, represented as ().
+ * There can be several arcs from a same state to a same other.
+ * Our NFAs do not have empty labels, so we use "()" as labels for them.
+ * Here we redefine some methods of ReParallel.NFA and subclass ReParallel.DFA
+ * to cope with this.
+ *
+ * Run as:
+ *
+ * java -cp ..;..\.. pbsp.ReVtf "ondrik automata-benchmarks master nfa-armc_Bakery4pBinEnc-FbOneOne-Nondet-Partial"
+ */
+
+/**
+ * The <code>ReVtf</code> class is the control class of the vtf compiler.
+ *
+ * @author  Angelo Borsotti
+ * @version 1.0   4 Jan 2022
+ */
+
+public class ReVtf {
+
+    #define function TRACE(fl,frm,a){
+        var fls = "";
+        if (fl.length == 1){
+            fls = "FL_" + fl;
+        } else {
+            for (var i = 0; i < fl.length; i++){
+                if (fls.length > 0) fls += "|";
+                fls += "FL_" + fl[i];
+            }
+            fls = "(" + fls + ")";
+        }
+        var str = "if ((" + fls + " & trc) != 0){" +
+            "Trc.out.printf(" + frm;
+        for (var i = 2; i < arguments.length; i++){
+            str += "," + arguments[i];
+        }
+        str += ");}"
+        return str;
+    };
+
+    /** The application name. */
+    private static final String TNAME = "REVTF";
+
+    /** The version. */
+    private static final String VERSION = "V1.0";
+
+    /** The command. */
+    private static Command cmd = new Command
+            ("revtf","revtf","revtf compiler",new Argument[] {
+        new Parameter("source","file",
+            Cli.AR_REQ,String.class,"bom",new Qualifier[] {
+            CliBundle.ENCOD}),
+        new Qualifier('c',"check","",0,String.class,
+            "trace flags"),
+    });
+
+    private static final int CMD_SOURCE  =  0;
+    private static final int   CMD_ENCOD =  0;
+    private static final int CMD_CHECK   =  1;
+
+    /** The command parser. */
+    static Cli com;
+
+    /** The default input file type. */
+    private static final String DEF_INP = ".vtf";
+
+    /** The input stream. */
+    private static IoStream inp;
+
+    /** The output stream. */
+    private static IoStream out;
+
+    /** The locale. */
+    private static Locale loc;
+
+    /** The trace flags. */
+    static int trc;
+
+    /*
+     * Internal constants for trace flags
+     */
+
+    /**
+     * The following trace flags are used:
+     * <p><blockquote><pre>
+     *    a   basic operations
+     *    b   basic operations details
+     *    z   stack trace
+     * </pre></blockquote><p>
+     */
+
+    static final int FL_A = 1 << ('a'-0x60);
+    static final int FL_B = 1 << ('b'-0x60);
+    static final int FL_Z = 1 << ('z'-0x60);
+
+    /**
+     * Set the trace flags which are specified in the argument.
+     * The string must contain only lowercase letters.
+     * Upon return <code>trc</code> is the powerset of flags augmented
+     * with the ones specified.
+     *
+     * @param      s string of flags
+     */
+
+    static void settrc(String s){
+        trc = 0;
+        for (int i = 0; i < s.length(); i++){
+            trc |= 1 << (s.charAt(i) - 0x60);
+        }
+    }
+
+    /**
+     * Analyse the command syntactically and semantically. Set the
+     * trace flags.
+     */
+
+    private static void checkCommand(){
+        if (com.present(CMD_CHECK) == Cli.PRESENT){   // check
+            String flags = com.strValue(CMD_CHECK);
+            for (int i = 0; i < flags.length(); i++){
+                int f = Character.toLowerCase(flags.charAt(i)) - 0x60;
+                if ((f < 0) || (31 < f)){
+                    error("illegal check flag");
+                }
+            }
+            settrc(flags);
+        }
+    }
+
+    /** The reference to the parser. */
+    private static Parser prs;
+    
+    /**
+     * Get the path specified in the command, read it if a file, or read each
+     * file in it if it denotes a directory, build a NFA, DFA and RI-MEFA for
+     * each one and produce a frequency distribution of the ratios NFA/DFA
+     * and RI-MEFA/DFA.
+     *
+     * @param      args command line arguments
+     */
+
+    public static void main(String[] args){
+        Locale.setDefault(Locale.US);
+        doit: try {
+            com = new Cli();
+            com.getCommand(cmd,args,0,VERSION);     // get command
+            if (com.res == Cli.NULL_COMMAND){       // no command to execute
+                break doit;
+            }
+            checkCommand();                         // command semantic check
+            TRACE(A,"command parsed\n");
+
+            // get the bom directory or jar
+            FileReader gr = new FileReader("vtf.bnf");
+            prs = new Parser(gr);
+            //prs.settrcflags("q");
+            if (prs.errorList != null){
+                for (Failure i : prs.errorList){
+                    TRACE(A,"parse error in input: %s\n",i);
+                    error(i.toString());
+                }
+            }
+
+            // do not add a default otherwise it appends it to a directory
+            // inp = new IoStream(DEF_INP);            // init input stream
+            inp = new IoStream();            // init input stream
+            String enc = com.strValue(CMD_SOURCE,0);
+            if (enc.length() == 0) enc = null;
+            inp.find(com.strValue(CMD_SOURCE));
+            int stat = inp.getStatus();
+            if ((stat & IoStream.DIRECTORY) != 0){
+                // it is a directory
+                String[] dirlist = inp.dirList();
+                // process each file
+                inp.close();                              // close input
+
+                // the input is a directory, then read each file,
+                // process it, and produce the distribution
+                int n = 0;
+                int totstates = 0;
+                double[] populn = new double[dirlist.length];
+                double[] populr = new double[dirlist.length];
+                double[] populs = new double[dirlist.length];
+                for (int i = 0; i < dirlist.length; i++){
+                    Trc.out.printf("processing %s %s\n",i,dirlist[i]);
+                    inp.open(com.strValue(CMD_SOURCE) + "\\" + dirlist[i],
+                        enc,IoStream.CHARS);
+                    process(inp);
+                    Trc.out.printf("nfa %s dfa %s min-me-dfa %s\n",
+                        nfa.stateNr,dfa.stateNr,dfa.start1.length);
+                    if (nfa.stateNr < dfa.stateNr || nfa.stateNr < dfa.start1.length){
+                        Trc.out.printf("---- ok\n");
+                        n++;
+                    }
+                    totstates += nfa.stateNr;
+                    populn[i] = (double)nfa.stateNr/dfa.stateNr;
+                    populr[i] = (double)dfa.start1.length/dfa.stateNr;
+                    populs[i] = (double)nfa.stateNr;
+                    inp.close();                              // close input
+                }
+                Trc.out.printf("nr of nfas smaller %s, %.2f%% of total %s\n",
+                    n,(double)n*100/dirlist.length,dirlist.length);
+                double[] rank = new double[]{0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,2.0};
+                Statistics sn = new Statistics(populn);
+                sn.rank = rank;
+                sn.frequency();
+                Statistics sr = new Statistics(populr);
+                sr.rank = rank;
+                sr.frequency();
+                String lo = "-inf";
+                Statistics st = new Statistics(populs);
+                double[] ranks = new double[]{10,20,50,100,200,500,1000,2000,5000};
+                st.rank = ranks;
+                st.frequency();
+                Trc.out.printf("range\t\tnfa/dfa\tri-mefa/dfa\n");
+                for (int i = 0; i < sn.freqBuckets.length; i++){
+                    String up = i < rank.length ? String.format("%.2f",rank[i]) : "inf";
+                    Trc.out.printf("%s-%s\t%s\t%s\n",lo,up,sn.freqBuckets[i],sr.freqBuckets[i]);
+                    lo = up;
+                }
+                Trc.out.printf("nfa states\t\tnfas\n");
+                lo = "-inf";
+                for (int i = 0; i < st.freqBuckets.length; i++){
+                    String up = i < ranks.length ? String.format("%d",(int)ranks[i]) : "inf";
+                    Trc.out.printf("%s-%s\t%s\n",lo,up,st.freqBuckets[i]);
+                    lo = up;
+                }
+                Trc.out.printf("total nfa states %s\n",totstates);
+                Trc.out.printf("total dfa states %s max %s\n",totDfaStates,maxDfaStates);
+                Trc.out.printf("total ri-dfa states %s max %s\n",totMinMeDfaStates,maxMinMeDfaStates);
+                Trc.out.printf("total DFA build time %s ms, total min-me-dfa build time %s ms\n",
+                    totBuildDfa/1000000,totBuildMinMeDfa/1000000);
+                return;
+            }
+            inp.open(com.strValue(CMD_SOURCE),
+                enc,IoStream.CHARS);
+
+            process(inp);
+  
+            // handle errors
+            inp.close();                              // close input
+        } catch (IOException exc){
+            error("error " + exc.toString());
+            exc.printStackTrace(Trc.wrt);
+        }
+    }
+
+    /**
+     * Process a file and build the FAs for it.
+     *
+     * @param      inp input
+     */
+
+    private static void process(IoStream inp){
+        // parse input
+        boolean res = false;
+        try {
+            res = prs.parse(inp);
+        } catch(lbj.IOError exc){
+            error("IOERR");
+        }
+        TRACE(A,"parser result: %s\n",res);
+
+        if (res){
+            compile();
+        } else {
+            // report errors
+            String text = null;
+            try {
+                text = Files.readString(Paths.get(com.strValue(CMD_SOURCE)));
+            } catch (IOException exc){
+                error("ioerror " + exc.toString());
+            }
+            LineCol lc = lineNr(text,(int)(prs.index()));
+            error("not recognized at line " + lc.line + " col " + lc.col);
+        }
+    }
+
+    /**
+     * Print an error message and terminate execution.
+     *
+     * @param      msg message
+     */
+
+    static void error(String msg){
+        boolean stacktr = (FL_Z & trc) != 0;
+        if (msg != null){
+            System.err.printf("%s\n",msg);
+        }
+        if (stacktr){
+            new Throwable().printStackTrace(Trc.wrt);
+        }
+        System.exit(1);                    // exit with error
+    }
+
+    /**
+     * Deliver the number of the line and column of the specified index in the specified text.
+     *
+     * @param      text text
+     * @param      index index
+     * @return     line and column number
+     */
+
+    record LineCol(int line, int col){};
+
+    static LineCol lineNr(String text, int index){
+        int line = 0;
+        int startline = 0;
+        for (int i = 0; i < index; i++){
+            char c = text.charAt(i);
+            if (c == '\r'){
+                startline = i;
+                line++;
+                if (i < text.length()-1){
+                    if (text.charAt(i+1) == '\n'){;
+                        i++;
+                    }
+                }
+            } else if (c == '\n'){
+                startline = i;
+                line++;
+            }
+        }
+        return new LineCol(line,index-startline);
+    }
+
+    /**
+     * Process a file.
+     *
+     * @param      der number of derivation
+     * @param      second <code>true</code> if second pass, <code>false</code> otherwise
+     */
+
+    private static void file(int der, boolean second){
+        TRACE(A,"file %s\n",second);
+        // rule: <file> ::= ·{{<eol>}*<section>}*{<eol>}*
+        // element nr 0 group
+        int der_0 = prs.getElement(der,0);
+        for (int i = 0; i < prs.getLength(der_0); i++){
+            // body of iteration
+            int der_0b = prs.getElement(der_0,i);
+            // rule: <file> ::= {·{<eol>}*<section>}*{<eol>}*
+            // element nr 0 group
+            // element nr 1: section
+            int section_2 = 1;
+            int der_0b_section_2 = prs.getElement(der_0b,section_2);
+            section(der_0b_section_2,second);
+        }
+    }
+
+    /**
+     * Process a section.
+     *
+     * @param      der number of derivation
+     * @param      second <code>true</code> if second pass, <code>false</code> otherwise
+     */
+
+    private static void section(int der, boolean second){
+        // rule: <section> ::= ·"@"<string> <eol>{{<eol>}*<line>}*
+        // element nr 1: string
+        int string = 1;
+        int der_string = prs.getElement(der,string);
+        String name = prs.toString(der_string);
+        TRACE(A,"section %s %s\n",name,second);
+        if (!name.equals("NFA")){
+            error("not an nfa");
+        }
+        if (!second){
+            stateMap = new HashMap<String,Nfa.State>();
+            alphaMap = new HashMap<String,Integer>();
+            re = new ReParallel();
+            nfa = re.new GMYNfa();
+        }
+        // element nr 3 group
+        int der_3 = prs.getElement(der,3);
+        for (int i = 0; i < prs.getLength(der_3); i++){
+            // body of iteration
+            int der_3b = prs.getElement(der_3,i);
+            // rule: <section> ::= "@"<string> <eol>{·{<eol>}*<line>}*
+            // element nr 1: line
+            int line_2 = 1;
+            int der_3b_line_2 = prs.getElement(der_3b,line_2);
+            line(der_3b_line_2,second);
+        }
+    }
+
+    /**
+     * Process a line.
+     *
+     * @param      der number of derivation
+     * @param      second <code>true</code> if second pass, <code>false</code> otherwise
+     */
+
+    private static void line(int der, boolean second){
+        // rule: <line> ::= ·<line meat> <eol>
+        // element nr 0: lineMeat
+        int lineMeat = 0;
+        int der_lineMeat = prs.getElement(der,lineMeat);
+        lineMeat(der_lineMeat,second);
+    }
+
+    /**
+     * Process a line meat.
+     *
+     * @param      der number of derivation
+     * @param      second <code>true</code> if second pass, <code>false</code> otherwise
+     */
+
+    private static void lineMeat(int der, boolean second){
+        TRACE(A,"lineMeat %s\n",second);
+        // get the number of the alternative
+        int altNr_der = prs.getAltNr(der);
+        if (altNr_der == 0){
+            if (second) return;
+            // alternative nr 0: <line meat> ::= ·<token list>
+            // element nr 0: tokenList
+            int tokenList_2 = 0;
+            int der_tokenList_2 = prs.getElement(der,tokenList_2);
+            LinkedList<String> list = tokenList(der_tokenList_2);
+            if (list.size() < 3){
+                // error("not enough arguments");
+                return;
+            }
+            Nfa.State sfrom = newState(list.peekFirst());
+            Nfa.State sto = newState(list.peekLast());
+            String arcsym = list.get(1);
+            // nfa has only chars or char subclasses as arc labels
+            Integer ai = alphaMap.get(arcsym);
+            if (ai == null){
+                ai = alphaMap.size();
+                alphaMap.put(arcsym,ai);
+            }
+            nfa.addArc(sfrom,sto,re.newSymbolChar(ai));
+        } else if (altNr_der == 1){
+            // alternative nr 1: <line meat> ::= ·<meta line>
+            // element nr 0: metaLine
+            int metaLine_2 = 0;
+            int der_metaLine_2 = prs.getElement(der,metaLine_2);
+            metaLine(der_metaLine_2,second);
+        }
+    }
+
+    /**
+     * Process a token list.
+     *
+     * @param      der number of derivation
+     * @return     list of tokens
+     */
+
+    private static LinkedList<String> tokenList(int der){
+        LinkedList<String> list = new  LinkedList<String>();
+        // rule: <token list> ::= ·{<tok>}*
+        // element nr 0 group
+        int der_0 = prs.getElement(der,0);
+        for (int i = 0; i < prs.getLength(der_0); i++){
+            // body of iteration
+            int der_0b = prs.getElement(der_0,i);
+            // rule: <token list> ::= {·<tok>}*
+            // element nr 0: tok
+            int tok_2 = 0;
+            int der_0b_tok_2 = prs.getElement(der_0b,tok_2);
+            String t = tok(der_0b_tok_2);
+            list.add(t);
+        }
+        return list;
+    }
+
+    /**
+     * Process a meta line.
+     *
+     * @param      der number of derivation
+     * @param      second <code>true</code> if second pass, <code>false</code> otherwise
+     */
+
+    private static void metaLine(int der, boolean second){
+        // rule: <meta line> ::= ·"%"<string> <token list>
+        // element nr 1: string
+        int string = 1;
+        int der_string = prs.getElement(der,string);
+        String name = prs.toString(der_string);
+        TRACE(A,"metaLine %s %s\n",name,second);
+        // element nr 2: tokenList
+        int tokenList = 2;
+        int der_tokenList = prs.getElement(der,tokenList);
+        LinkedList<String> list = tokenList(der_tokenList);
+        if (list.isEmpty()){
+            return;
+        }
+        if (name.equals("Name")){
+            TRACE(A,"name %s\n",name);
+        } else if (name.equals("Alphabet")){
+            TRACE(A,"Alphabet %s\n",name);
+        } else if (name.equals("Initial")){
+            if (second){
+                name = list.peekFirst();
+                TRACE(A,"Initial %s\n",name);
+                Nfa.State s = stateMap.get(name);
+                if (s == null){
+                    System.err.printf("unknown initial state: %s\n",name);
+                } else {
+                    s.initial = true;
+                }
+            }
+        } else if (name.equals("Final")){
+            if (second){
+                name = list.peekFirst();
+                TRACE(A,"Final %s\n",name);
+                Nfa.State s = stateMap.get(name);
+                if (s == null){
+                    System.err.printf("unknown final state: %s\n",name);
+                } else {
+                    s.accepting = true;
+                }
+            }
+        } else if (name.equals("States")){
+        } else {
+            error("unknown name: " + name);
+        }
+    }
+
+    /**
+     * Process a token.
+     *
+     * @param      der number of derivation
+     * @return     token
+     */
+
+    private static String tok(int der){
+        String res = "";
+        // get the number of the alternative
+        int altNr_der = prs.getAltNr(der);
+        if (altNr_der == 0){
+            // alternative nr 0: <tok> ::= ·<string>
+            // element nr 0: string
+            int string_2 = 0;
+            int der_string_2 = prs.getElement(der,string_2);
+            res = prs.toString(der_string_2);
+        } else if (altNr_der == 1){
+            // alternative nr 1: <tok> ::= ·<quoted string>
+            // element nr 0: quotedString
+            int quotedString_2 = 0;
+            int der_quotedString_2 = prs.getElement(der,quotedString_2);
+            res = prs.toString(der_quotedString_2);
+            res = strLitToString(res);
+        } else if (altNr_der == 2){
+            // alternative nr 2: <tok> ::= ·"("
+            res = "(";
+        } else if (altNr_der == 3){
+            // alternative nr 3: <tok> ::= ·")"
+            res = ")";
+        }
+        return res;
+    }
+
+    /**
+     * Convert a string literal into a string.
+     *
+     * @param      s string literal
+     * @return     string
+     */
+
+    private static String strLitToString(String s){
+        if (s.length() == 0) return "";
+        StringBuilder sb = new StringBuilder();
+        int cursor = 1;
+        doit: try {
+            boolean ok = false;
+            l: do {
+                char c = s.charAt(cursor);
+                cursor++;
+                esc: if (c == '\\'){                   // match escape
+                    char ch = s.charAt(cursor);
+                    switch (ch){
+                    case '\"': c = '\"'; break;
+                    }
+                    cursor++;
+                } else if (c == '\"'){
+                    break l;
+                } // esc
+                sb.append(c);              // append
+            } while (true); // l
+        } catch (StringIndexOutOfBoundsException exc){
+        }
+        return sb.toString();
+    }
+
+    /** The NFA. */
+    private static Nfa nfa;
+
+    /** The reference to the parallel recognizer. */
+    private static ReParallel re;
+
+    /** The map from state names to NFA states. */
+    private static Map<String,Nfa.State> stateMap;
+
+    /** The map from alphabet element names to integers. */
+    private static Map<String,Integer> alphaMap;
+
+    /** The DFA. */
+    private static Rep.VDfa dfa;
+
+    /** The total build time of the DFA. */
+    private static long totBuildDfa;
+
+    /** The total build time of the DFA. */
+    private static long totBuildMinMeDfa;
+
+    /** The total number of DFA states. */
+    private static long totDfaStates;
+
+    /** The max number of DFA states. */
+    private static long maxDfaStates;
+
+    /** The total number of MIN-ME-DFA states. */
+    private static long totMinMeDfaStates;
+
+    /** The max number of MIN-ME-DFA states. */
+    private static long maxMinMeDfaStates;
+    
+    /**
+     * Walk the parse tree and build the FAs.
+     */
+
+    private static void compile(){
+        TRACE(A,"compile\n");        
+        file(prs.getStart(),false);
+        file(prs.getStart(),true);
+        // this works if in each file there is only one nfa
+        nfa.table = new Nfa.State[nfa.stateNr];
+        for (Nfa.State s = nfa.head; s != null; s = s.suc){
+            nfa.table[s.number] = (Nfa.State)s;
+        }
+        if ((FL_A & trc) != 0){
+            nfaTrace();
+        }
+
+        // nfaTrace();
+
+        Trc.out.printf("nfa done, building dfa\n");
+        // then build the dfa
+        TRACE(A,"dfa\n");
+        Rep rep = new Rep();
+        rep.nfa = nfa;
+        re.nfa = nfa;
+        long t0 = System.nanoTime();
+        dfa = rep.new VDfa();
+        dfa.trc = trc;
+        dfa.build();   // build dfa
+        dfa.minimize();
+        totBuildDfa += System.nanoTime() - t0;
+        if ((FL_A & trc) != 0){
+            dfa.trace();
+        }
+        totDfaStates += dfa.stateNr;
+        if (dfa.stateNr > maxDfaStates) maxDfaStates = dfa.stateNr;
+
+        TRACE(A,"dfa built\n");
+
+        Trc.out.printf("dfa done, building min-me-dfa\n");
+        t0 = System.nanoTime();
+        dfaStates = dfa.stateNr;
+        dfa.startStates = new int[nfa.table.length];
+        for (int i = 0; i < nfa.table.length; i++){           // 0 already done
+            Dfa.State state = dfa.new State();
+            IntSetBit nstates = re.new IntSetBit(i);
+            state.nfaStates = nstates;
+            TRACE(B,"start adding singleton for nfa state %s %s\n",i,nstates);
+            boolean b = dfa.addUnique(state);                 // add a state with these items
+            dfa.startStates[i] = dfa.lastAdded.number;
+            if ((FL_B & trc) != 0){
+                Trc.out.printf("singleton state: reaches %s\n",nstates);
+                dfa.dfaStateTrace(state);
+            }
+            if (b){                          // state added
+                dfa.buildPilot(state);       // build the pilot
+            }
+            TRACE(B,"end adding singleton for nfa state %s\n",i);
+        }
+        totBuildMinMeDfa += System.nanoTime() - t0;
+        totMinMeDfaStates += dfa.stateNr;
+        if (dfa.stateNr > maxMinMeDfaStates) maxMinMeDfaStates = dfa.stateNr;
+
+        // check the consistence of the DFA
+        //Trc.out.printf("--checking--\n");
+        for (Dfa.State s = dfa.head; s != null; s = s.suc){
+            if (s.number >= dfa.stateNr){
+                Trc.out.printf(" ---!!!! %s >= %s\n",s.number,dfa.stateNr);
+            }
+            for (Dfa.Arc t = s.transList; t != null; t = t.next){    // trace its transitions
+                if (t.nextState == null){
+                    Trc.out.printf(" ---!!!! %s -> %s\n",s,alphaName(t.sclass));
+                    dfa.trace();
+                } else if (t.nextState.number >= dfa.stateNr){
+                    Trc.out.printf(" ---!!!! state %s tran err\n",s);
+                    dfa.trace();
+                    //dfaStateTrace(s);
+                }
+            }
+        }
+        Trc.out.printf("min-me-dfa done, minimizing\n");
+        dfa.minimize();
+        Trc.out.printf("min-me-dfa done, minimizing initials\n");
+        dfa.minimizeMeDfa();
+        Trc.out.printf("done\n");
+    }
+
+    /** The number of DFA states (before the RI-MEFA ones are added to it. */
+    private static int dfaStates;
+
+    /**
+     * Create a new NFA state.
+     *
+     * @param      name state name
+     */
+
+    private static Nfa.State newState(String name){
+        Nfa.State s = stateMap.get(name);
+        if (s != null){
+            return s;
+        }
+        Nfa.State n = nfa.new State();
+        n.number = nfa.stateNr++;
+        if (nfa.last == null) nfa.head = n;     // append to list
+        else nfa.last.suc = n;
+        nfa.last = n;
+        nfa.lastAdded = n;
+        stateMap.put(name,n);
+        TRACE(A,"add new state %s\n",n.number);
+        return n;
+    }
+
+    /**
+     * Trace the NFA.
+     */
+
+    private static void nfaTrace(){
+        for (Nfa.State s = nfa.head; s != null; s = s.suc){
+            String status = "";
+            if (s.initial) status += " initial";
+            if (s.accepting) status += " final";
+            String statename = stateName(s);
+            Trc.out.printf("state: %s %s %s\n",s.number,statename,status);
+            Trc.out.printf("  transitions:\n");
+            for (Nfa.Arc t = s.transList; t != null; t = t.next){
+                Trc.out.printf("    %s->%s %s\n",alphaName(t.sym.sym),
+                    t.nextState.number,stateName(nfa.table[t.nextState.number]));
+            }
+        }
+    }
+
+    /**
+     * Deliver the name of the specified state.
+     *
+     * @param      s state
+     * @return     string
+     */
+
+    private static String stateName(Nfa.State s){
+        String statename = "";
+        for (Map.Entry<String,Nfa.State> entry : stateMap.entrySet()){
+            String k = entry.getKey();
+            Nfa.State v = entry.getValue();
+            if (v == s){
+                statename = k;
+                break;
+            }
+        }
+        return statename;
+    }
+
+    /**
+     * Deliver the name of the specified element of alphabet.
+     *
+     * @param      i integer representing the element
+     * @return     string
+     */
+
+    private static String alphaName(int i){
+        String alphaname = "";
+        for (Map.Entry<String,Integer> entry : alphaMap.entrySet()){
+            String k = entry.getKey();
+            Integer v = entry.getValue();
+            if (v == i){
+                alphaname = k;
+                break;
+            }
+        }
+        return alphaname;
+    }
+    
+    /**
+     * A class to envelope a subclass of the ReParallel DFA.
+     */
+
+    static class Rep extends ReParallel {
+
+        /**
+         * A DFA with integer in the arcs representing alphabet elements which
+         * are strings. This DFA does not contain a compressed transition table.
+         */
+
+        class VDfa extends Dfa {
+
+            /**
+             * An arc (transition) with an integer label representing an alphabet element.
+             */
+
+            class VArc extends Arc {
+
+                /**
+                 * Deliver a new transition with the specified label and next state.
+                 *
+                 * @param   s label
+                 * @param   next next state
+                 * @return  transition
+                 */
+
+                VArc(int s, State next){
+                    super(s,next);
+                }
+
+                /**
+                 * Deliver a string representing this object.
+                 *
+                 * @return  string
+                 */
+
+                public String toString(){
+                    return String.format("-%s->%s",
+                        alphaName(this.sclass),this.nextState.number);
+                }
+            }
+
+            /**
+             * Trace the specified state.
+             *
+             * @param   s state
+             */
+
+            private void dfaStateTrace(State s){
+                String status = "";
+                if (s.accepting) status += " final";
+                Trc.out.printf("state: %s%s",s.number,status);
+                Trc.out.printf(" %s\n",s.nfaStates);
+                if (s.transList != null){
+                    Trc.out.printf("  transitions\n");
+                    for (Arc t = s.transList; t != null; t = t.next){    // trace its transitions
+                        Trc.out.printf("    -%s->%s\n",alphaName(t.sclass),
+                            t.nextState == null ? -1 : t.nextState.number);
+                    }
+                }
+            }
+
+            /**
+             * Trace this FA.
+             */
+
+            public void trace(){
+                for (State s = this.head; s != null; s = s.suc){
+                    dfaStateTrace(s);
+                }
+            }
+
+            /**
+             * Build the pilot.
+             *
+             * @param      starts state from which the building must begin
+             */
+
+            void buildPilot(State starts){
+                TRACE(EA,"buildPilot\n");
+
+                // visit the initial state and the ones generated after it
+                // to create all other states
+                synth_attr(starts);
+                IntSetBit rea = new IntSetBit();
+                for (State cur = starts; cur != null; cur = (State)cur.suc){
+                    TRACE(E,"processing state: %s %s\n",cur.number,cur.nfaStates);
+                    // collect the symbols that make transitions of this state
+                    LinkedList<Integer> shifts = new LinkedList<Integer>();
+                    // scan all its NFA states
+                    int[] ns = cur.nfaStates.toArray();
+                    for (int i = 0; i < ns.length; i++){
+                        // arcs have int labels
+                        for (Nfa.Arc t = nfa.table[ns[i]].transList; t != null; t = t.next){
+                            if (!shifts.contains(t.sym.sym)){
+                                shifts.add(t.sym.sym);
+                            }
+                        }
+                    }
+                    TRACE(E,"  shifts: %s\n",shifts);
+                    for (int n : shifts){                    // for all the shifts
+                        // n is the number of the label
+                        // determine the nfa states reached
+                        rea.clear();
+                        for (int j = 0; j < ns.length; j++){
+                            int i = ns[j];
+                            // take the states reached from nstate with symbol n
+                            Nfa.State s = nfa.table[i];
+                            for (Nfa.Arc t = s.transList; t != null; t = t.next){
+                                if (t.sym.sym == n){
+                                    rea.add(t.nextState.number);
+                                }
+                            }
+                        }
+                        TRACE(E,"    reached %s with shift: %s\n",rea,n);
+                        // if there are no states, the current is final
+                        if (rea.isEmpty()){
+                            cur.accepting = true;
+                            continue;
+                        }
+                        // there is at least one state reached with n
+                        State nextstate = new State();
+                        nextstate.nfaStates = (IntSetBit)rea.clone();
+                        synth_attr(nextstate);
+                        addUnique(nextstate);
+                        nextstate = (State)this.lastAdded;
+                        if (nextstate == null){
+                            Trc.out.printf(" --- !!!!\n");
+                        }
+
+                        TRACE(E,"   adding trans to %s subclass %s\n",nextstate.number,n);
+                        cur.addArc(new VArc(n,nextstate));
+                        if ((FL_E & trc) != 0){
+                            Trc.out.printf("    next state:\n");
+                            dfaStateTrace(nextstate);
+                        }
+                    }
+                }
+                //Trc.out.printf("--checking--\n");
+                for (State s = this.head; s != null; s = s.suc){
+                    for (Arc t = s.transList; t != null; t = t.next){    // trace its transitions
+                        if (t.nextState == null){
+                            Trc.out.printf(" !!!! %s -> %s\n",s,alphaName(t.sclass));
+                            trace();
+                        } else if (t.nextState.number >= this.stateNr){
+                            Trc.out.printf(" !!!! state %s tran err\n",s);
+                            trace();
+                            //dfaStateTrace(s);
+                        }
+                    }
+                }
+                TRACE(EA,"minimize states %s\n",this.stateNr);
+                if ((FL_E & trc) != 0){
+                    trace();
+                }
+                TRACE(EA,"buildPilot done\n");
+            }
+
+            /**
+             * Minimize this FA.
+             */
+
+            void minimize(){
+                minimizeDfa(true);
+                if ((FL_E & trc) != 0){
+                    trace();
+                }
+            }
+
+            /**
+             * Build this FA.
+             */
+
+            void build(){
+                TRACE(EA,"build dfa\n");
+                // build the first state
+                State state = new State();
+                IntSetBit rea = new IntSetBit();
+                for (int i = 0; i < nfa.table.length; i++){
+                    Nfa.State s = nfa.table[i];
+                    if (s.initial){
+                        rea.add(i);
+                    }
+                }
+                state.nfaStates = rea;
+                addUnique(state);                          // add a state with these items
+                if ((FL_E & trc) != 0){
+                    Trc.out.printf("first state:\n");
+                    state.trace();
+                }
+
+                buildPilot(state);                     // build the pilot
+                strictStateNr = this.stateNr;
+
+                if ((FL_E & trc) != 0){
+                    Trc.out.printf("end build fa\n");
+                    trace();
+                }
+                TRACE(EA,"build dfa done\n");
+            }
+
+            /**
+             * Deliver a string representing the graph of this FA.
+             */
+
+            String toGraph(){
+                Graph g = new Graph(Graph.DIRECTED);
+                g.name = "fa";
+                // create all nodes
+                Node[] nodes = new Node[this.stateNr];
+                for (int i = 0; i < this.stateNr; i++){
+                    nodes[i] = g.newNode("" + i);
+                }
+                // create then the edges
+                for (int i = 0; i < this.stateNr; i++){
+                    State s = this.table[i];
+                    if (s.transList != null){
+                        for (Arc t = s.transList; t != null; t = t.next){
+                            g.newEdge(nodes[s.number],nodes[t.nextState.number],"\"" +
+                                alphaName(t.sclass) + "\"",true);
+                        }
+                    }
+                }
+                return g.toString();
+            }
+        }
+    }
+}

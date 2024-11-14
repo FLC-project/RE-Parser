@@ -1,0 +1,60 @@
+Authors: Angelo Borsotti
+
+This program contains the implementation the parallel RE parser and recognizer.
+
+Installation
+
+    There is no need to install it, the program can be run directly from a command prompt.
+    The data of the Fasta, Traffic and Bible benchmarks must be downloaded from the
+    sites reported in the papers.
+
+Run
+
+    java -cp repar.jar pbsp.ReParTest  <arguments>
+
+The <arguments> are described in ReParTest.jpp.
+Omitting the arguments runs the measurements of the parallel parser that are
+described in the papers.
+
+Generation
+
+    The program has been developed with Oracle jdk 19.
+
+The sources are provided here to show an implementation of the algorithms described
+in the papers. The generation of the ReParTest program needs tools and libraries that
+are not provided here.
+
+Motivating example
+
+The example described in the introduction of the paper has been done as follows:
+
+$ grep "To:" examplemail.txt | awk -f re.awk
+ Tom White
+ Paul Brown
+ Lily Roberts
+ Elon Musk
+ bla bla To: my friends
+ bla bla
+ Paul Brown
+
+$ java -cp regrep.jar pbsp.ReGrep mail examplemail "0/2/0/8/0/4|0/2/0/8/0/5/*/2"
+Tom White
+Paul Brown
+Lily Roberts
+
+All the files above are provided too.
+
+Distro
+
+This software is made of the following files:
+
+    ReParallel.jpp      parser and recognizer
+    ReParTest.jpp       test driver
+    repar.jar           executable test driver
+    samples4.ser        data of the Regen benchmark
+    ReVtf.jpp           parser and analyzer of the NFAs of the Ondrik benchmark
+    examplemail.txt     text of the motivating example
+    re.awk              awk program to clean the grep results
+    mail.re             RE describing the text of the motivating example
+    README              this file
+    COPYING             license
